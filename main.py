@@ -98,20 +98,34 @@ def transform(dx: int, dy: int, rot: int, fx: bool, fy: bool) -> tuple[int, int]
 
 # ── Device discovery ──────────────────────────────────────────────────────────
 
+# Sentinel returned by find_mice() when all devices are unreadable
+_PERM_ERROR = "__permission_error__"
+
+
 def find_mice() -> list[tuple[str, str]]:
-    """Return [(path, name)] for every device that reports REL_X and REL_Y."""
+    """
+    Return [(path, name)] for every device that reports relative X+Y axes.
+    Returns [(_PERM_ERROR, ...)] if all readable paths fail with PermissionError.
+    """
     if not HAS_EVDEV:
         return []
     result: list[tuple[str, str]] = []
-    for path in evdev.list_devices():
+    perm_denied = 0
+    paths = list(evdev.list_devices())
+    for path in paths:
         try:
             d = InputDevice(path)
             rel = d.capabilities().get(ecodes.EV_REL, [])
             if ecodes.REL_X in rel and ecodes.REL_Y in rel:
                 result.append((path, d.name))
             d.close()
+        except PermissionError:
+            perm_denied += 1
         except Exception:
             pass
+    # If we got nothing but had permission errors, tell the caller why
+    if not result and perm_denied > 0:
+        return [(_PERM_ERROR, f"Permission denied on {perm_denied} device(s)")]
     return result
 
 
@@ -427,9 +441,19 @@ class App(QMainWindow):
         """Populate the device combo, preserving the current selection."""
         prev = self._dev.currentData()
         self._dev.clear()
-        for path, name in find_mice():
-            self._dev.addItem(f"{name}  [{path}]", path)
-        if not self._dev.count():
+        devices = find_mice()
+        if devices and devices[0][0] == _PERM_ERROR:
+            self._dev.addItem(
+                "⚠  Permission denied — run setup.sh or: newgrp input", ""
+            )
+            self._dev.setStyleSheet(
+                self._dev.styleSheet() + " QComboBox { color: #f38ba8; }"
+            )
+        elif devices:
+            self._dev.setStyleSheet("")  # reset any error colour
+            for path, name in devices:
+                self._dev.addItem(f"{name}  [{path}]", path)
+        else:
             self._dev.addItem("No mouse devices detected", "")
         for i in range(self._dev.count()):
             if self._dev.itemData(i) == prev:
