@@ -2,41 +2,39 @@
 """
 Mouse Axis Remapper
 ===================
-Intercepts raw mouse motion at the kernel level (evdev → uinput) and
-re-injects it with corrected axes.  Because interception happens BEFORE
-libinput sees the device, this works identically on Wayland, Xorg, and
-every desktop environment — no firmware access required.
+Intercepts raw mouse motion and re-injects it with corrected axes.
 
-Your mouse (1bcf:08a0) has its sensor rotated 90° CW inside the body.
-Select "90° Clockwise" to fix "up moves right / down moves left".
+Linux  : evdev → uinput (kernel-level, works on Wayland + Xorg)
+Windows: WH_MOUSE_LL hook → SendInput (system-wide, all mice)
+
+No firmware access required.  Select the rotation that matches your
+sensor orientation and click Start.
 """
 
 import sys
 import os
 
-# ── Auto re-exec with 'input' group (must run before any Qt import) ───────────
-def _ensure_input_group() -> None:
-    """
-    If the current process does not have the 'input' group active, re-exec
-    this exact binary under 'sg input' so /dev/input/* and /dev/uinput are
-    accessible without requiring the user to log out and back in.
-    """
-    import grp, shlex
-    try:
-        gid = grp.getgrnam("input").gr_gid
-    except KeyError:
-        return  # no 'input' group on this system — nothing to do
-    if gid not in os.getgroups():
-        cmd = " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
-        os.execvp("sg", ["sg", "input", "-c", cmd])
+PLATFORM = sys.platform  # 'linux', 'win32', 'darwin'
 
-_ensure_input_group()
+# ── Linux only: auto re-exec with 'input' group before any Qt import ──────────
+if PLATFORM == "linux":
+    def _ensure_input_group() -> None:
+        import grp, shlex
+        try:
+            gid = grp.getgrnam("input").gr_gid
+        except KeyError:
+            return
+        if gid not in os.getgroups():
+            cmd = " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
+            os.execvp("sg", ["sg", "input", "-c", cmd])
+    _ensure_input_group()
 # ─────────────────────────────────────────────────────────────────────────────
 
 import json
 import select
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -47,19 +45,85 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
-try:
-    import evdev
-    from evdev import InputDevice, UInput, ecodes
-    HAS_EVDEV = True
-except ImportError:
-    HAS_EVDEV = False
+# ── Linux: evdev / uinput ─────────────────────────────────────────────────────
+HAS_EVDEV = False
+if PLATFORM == "linux":
+    try:
+        import evdev
+        from evdev import InputDevice, UInput, ecodes
+        HAS_EVDEV = True
+    except ImportError:
+        pass
+
+# ── Windows: ctypes low-level hook + SendInput ────────────────────────────────
+if PLATFORM == "win32":
+    import ctypes
+    import ctypes.wintypes as _wt
+
+    _user32   = ctypes.WinDLL("user32",   use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    WH_MOUSE_LL      = 14
+    WM_MOUSEMOVE     = 0x0200
+    WM_QUIT          = 0x0012
+    LLMHF_INJECTED   = 0x00000001
+    MOUSEEVENTF_MOVE = 0x0001
+    INPUT_MOUSE      = 0
+    PM_REMOVE        = 0x0001
+
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class _MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("pt",          _POINT),
+            ("mouseData",   _wt.DWORD),
+            ("flags",       _wt.DWORD),
+            ("time",        _wt.DWORD),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx",          ctypes.c_long),
+            ("dy",          ctypes.c_long),
+            ("mouseData",   ctypes.c_ulong),
+            ("dwFlags",     ctypes.c_ulong),
+            ("time",        ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _anonymous_ = ("_u",)
+        _fields_ = [("type", ctypes.c_ulong), ("_u", _INPUT_UNION)]
+
+    _HOOKPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, _wt.WPARAM, _wt.LPARAM
+    )
+
+    _user32.SetWindowsHookExW.restype  = ctypes.c_void_p
+    _user32.CallNextHookEx.restype     = ctypes.c_long
+    _user32.GetCursorPos.argtypes      = [ctypes.POINTER(_POINT)]
+    _user32.PostThreadMessageW.argtypes = [_wt.DWORD, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
+    _kernel32.GetCurrentThreadId.restype = _wt.DWORD
 
 # ── Paths & constants ─────────────────────────────────────────────────────────
 
 CONFIG_PATH  = Path.home() / ".config" / "mouse-remapper" / "config.json"
-AUTOSTART    = Path.home() / ".config" / "autostart" / "mouse-remapper.desktop"
 SCRIPT_PATH  = Path(__file__).resolve()
 VENV_PYTHON  = SCRIPT_PATH.parent / "venv" / "bin" / "python3"
+
+if PLATFORM == "win32":
+    _STARTUP = (
+        Path(os.environ.get("APPDATA", ""))
+        / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+    )
+    AUTOSTART = _STARTUP / "mouse-axis-remapper.bat"
+else:
+    AUTOSTART = Path.home() / ".config" / "autostart" / "mouse-remapper.desktop"
 
 DEFAULTS: dict = {
     "device_path": "",
@@ -125,8 +189,11 @@ _PERM_ERROR = "__permission_error__"
 def find_mice() -> list[tuple[str, str]]:
     """
     Return [(path, name)] for every device that reports relative X+Y axes.
-    Returns [(_PERM_ERROR, ...)] if all readable paths fail with PermissionError.
+    On Windows returns a single synthetic entry for the system-wide hook.
+    Returns [(_PERM_ERROR, ...)] on Linux if all readable paths fail with PermissionError.
     """
+    if PLATFORM == "win32":
+        return [("__win_system__", "System Mouse  [Windows — all mice]")]
     if not HAS_EVDEV:
         return []
     result: list[tuple[str, str]] = []
@@ -149,9 +216,99 @@ def find_mice() -> list[tuple[str, str]]:
     return result
 
 
-# ── Remapping worker (background QThread) ────────────────────────────────────
+# ── Remapping worker — Windows (WH_MOUSE_LL → SendInput) ─────────────────────
 
-class RemapWorker(QThread):
+if PLATFORM == "win32":
+    class RemapWorker(QThread):
+        """
+        Installs a system-wide low-level mouse hook (WH_MOUSE_LL).
+        Real WM_MOUSEMOVE events are suppressed; a transformed relative move
+        is re-injected via SendInput.  Injected events carry LLMHF_INJECTED
+        so the hook ignores them, preventing infinite loops.
+        """
+        status = pyqtSignal(str, bool)   # (message, is_error)
+
+        def __init__(self, path: str, rot: int, fx: bool, fy: bool) -> None:
+            super().__init__()
+            self.path  = path
+            self.rot   = rot
+            self.fx    = fx
+            self.fy    = fy
+            self._quit = threading.Event()
+            self._tid  = 0
+
+        def stop(self) -> None:
+            self._quit.set()
+            if self._tid:
+                _user32.PostThreadMessageW(
+                    _wt.DWORD(self._tid), WM_QUIT, 0, 0
+                )
+
+        def run(self) -> None:
+            self._tid = int(_kernel32.GetCurrentThreadId())
+
+            # Prime the message queue so PostThreadMessageW works immediately
+            msg = _wt.MSG()
+            _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE)
+
+            hook_ref: list = [None]   # mutable so the closure can read it
+
+            @_HOOKPROC
+            def _hook(nCode, wParam, lParam):
+                if nCode >= 0 and wParam == WM_MOUSEMOVE:
+                    info = ctypes.cast(
+                        lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)
+                    ).contents
+                    # Skip events we injected ourselves
+                    if not (info.flags & LLMHF_INJECTED):
+                        cur = _POINT()
+                        _user32.GetCursorPos(ctypes.byref(cur))
+                        dx = info.pt.x - cur.x
+                        dy = info.pt.y - cur.y
+                        if dx or dy:
+                            nx, ny = transform(dx, dy, self.rot, self.fx, self.fy)
+                            mi = _MOUSEINPUT()
+                            mi.dx     = nx
+                            mi.dy     = ny
+                            mi.dwFlags = MOUSEEVENTF_MOVE
+                            inp = _INPUT()
+                            inp.type = INPUT_MOUSE
+                            inp.mi   = mi
+                            _user32.SendInput(
+                                1, ctypes.byref(inp), ctypes.sizeof(_INPUT)
+                            )
+                        return 1  # suppress original event
+                return _user32.CallNextHookEx(hook_ref[0], nCode, wParam, lParam)
+
+            self._hook_proc = _hook   # prevent GC while hook is active
+            hook_ref[0] = _user32.SetWindowsHookExW(WH_MOUSE_LL, _hook, None, 0)
+
+            if hook_ref[0] is None:
+                err = ctypes.get_last_error()
+                self.status.emit(
+                    f"Failed to install mouse hook (error {err}).\n\n"
+                    "Try running the app as Administrator.", True
+                )
+                return
+
+            self.status.emit("Active — remapping all mice (Windows hook)", False)
+
+            # Message loop — required for WH_MOUSE_LL to fire
+            while not self._quit.is_set():
+                if _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                    if msg.message == WM_QUIT:
+                        break
+                    _user32.TranslateMessage(ctypes.byref(msg))
+                    _user32.DispatchMessageW(ctypes.byref(msg))
+                else:
+                    time.sleep(0.001)   # 1 ms idle — minimal CPU use
+
+            _user32.UnhookWindowsHookEx(hook_ref[0])
+            self.status.emit("Stopped", False)
+
+# ── Remapping worker — Linux (evdev → uinput) ─────────────────────────────────
+
+class _LinuxRemapWorker(QThread):
     """
     Grabs the source device exclusively so raw events are invisible to
     the rest of the OS.  Applies the transformation and re-injects via
@@ -286,24 +443,39 @@ class RemapWorker(QThread):
             self.status.emit("Stopped", False)
 
 
-# ── Autostart helper ──────────────────────────────────────────────────────────
+# ── Worker alias — pick the right class for the current platform ──────────────
+if PLATFORM != "win32":
+    RemapWorker = _LinuxRemapWorker
+
+
+# ── Autostart helper (platform-aware) ─────────────────────────────────────────
 
 def set_autostart(enabled: bool) -> None:
-    """Create or remove the XDG autostart .desktop entry."""
-    if enabled:
-        py = str(VENV_PYTHON) if VENV_PYTHON.exists() else "python3"
-        AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
-        AUTOSTART.write_text(
-            "[Desktop Entry]\n"
-            "Type=Application\n"
-            "Name=Mouse Axis Remapper\n"
-            f"Exec={py} {SCRIPT_PATH}\n"
-            "Hidden=false\n"
-            "NoDisplay=false\n"
-            "X-GNOME-Autostart-enabled=true\n"
-        )
+    if PLATFORM == "win32":
+        if enabled:
+            # .bat in Windows Startup folder
+            exe = str(Path(sys.executable).parent / "mouse-axis-remapper.exe")
+            if not Path(exe).exists():
+                exe = sys.executable
+            AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART.write_text(f'@echo off\nstart "" "{exe}"\n', encoding="utf-8")
+        else:
+            AUTOSTART.unlink(missing_ok=True)
     else:
-        AUTOSTART.unlink(missing_ok=True)
+        if enabled:
+            py = str(VENV_PYTHON) if VENV_PYTHON.exists() else "python3"
+            AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+            AUTOSTART.write_text(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=Mouse Axis Remapper\n"
+                f"Exec={py} {SCRIPT_PATH}\n"
+                "Hidden=false\n"
+                "NoDisplay=false\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+        else:
+            AUTOSTART.unlink(missing_ok=True)
 
 
 # ── Qt stylesheet (Catppuccin Mocha palette) ──────────────────────────────────
@@ -422,12 +594,13 @@ class App(QMainWindow):
         bh.addWidget(self._qb)
         vb.addLayout(bh)
 
-        # ── Permissions helper ────────────────────────────────────────────────
-        pb = QPushButton("⚙  Fix Permissions  (requires sudo — run once after install)")
-        pb.setObjectName("permBtn")
-        pb.setFixedHeight(32)
-        pb.clicked.connect(self._fix_perms)
-        vb.addWidget(pb)
+        # ── Permissions helper (Linux only) ───────────────────────────────────
+        if PLATFORM != "win32":
+            pb = QPushButton("⚙  Fix Permissions  (requires sudo — run once after install)")
+            pb.setObjectName("permBtn")
+            pb.setFixedHeight(32)
+            pb.clicked.connect(self._fix_perms)
+            vb.addWidget(pb)
 
         # ── Autostart ─────────────────────────────────────────────────────────
         self._auto = QCheckBox("Start automatically on login")
@@ -435,12 +608,19 @@ class App(QMainWindow):
         vb.addWidget(self._auto)
 
         # ── Info ──────────────────────────────────────────────────────────────
-        hint = QLabel(
-            "ℹ  Remapping runs at kernel level via evdev/uinput — "
-            "fully compatible with Wayland and Xorg.  "
-            "The original device is captured exclusively; "
-            "the virtual device is what the OS sees."
-        )
+        if PLATFORM == "win32":
+            info_text = (
+                "ℹ  Remapping via a system-wide low-level mouse hook (WH_MOUSE_LL + SendInput). "
+                "All connected mice are remapped. Works across all Windows applications."
+            )
+        else:
+            info_text = (
+                "ℹ  Remapping runs at kernel level via evdev/uinput — "
+                "fully compatible with Wayland and Xorg.  "
+                "The original device is captured exclusively; "
+                "the virtual device is what the OS sees."
+            )
+        hint = QLabel(info_text)
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #6c7086; font-size: 11px;")
         vb.addWidget(hint)
@@ -596,11 +776,11 @@ def main() -> None:
     app.setApplicationName("MouseAxisRemapper")
     app.setQuitOnLastWindowClosed(True)
 
-    if not HAS_EVDEV:
+    if PLATFORM == "linux" and not HAS_EVDEV:
         QMessageBox.critical(
             None,
             "Missing Dependency",
-            "The 'evdev' library is required.\n\n"
+            "The 'evdev' library is required on Linux.\n\n"
             "Install it:\n"
             "  pip install evdev\n\n"
             "or run:  bash setup.sh",
