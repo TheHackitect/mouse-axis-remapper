@@ -12,8 +12,28 @@ Select "90° Clockwise" to fix "up moves right / down moves left".
 """
 
 import sys
-import json
 import os
+
+# ── Auto re-exec with 'input' group (must run before any Qt import) ───────────
+def _ensure_input_group() -> None:
+    """
+    If the current process does not have the 'input' group active, re-exec
+    this exact binary under 'sg input' so /dev/input/* and /dev/uinput are
+    accessible without requiring the user to log out and back in.
+    """
+    import grp, shlex
+    try:
+        gid = grp.getgrnam("input").gr_gid
+    except KeyError:
+        return  # no 'input' group on this system — nothing to do
+    if gid not in os.getgroups():
+        cmd = " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
+        os.execvp("sg", ["sg", "input", "-c", cmd])
+
+_ensure_input_group()
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json
 import select
 import subprocess
 import threading

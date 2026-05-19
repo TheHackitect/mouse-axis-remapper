@@ -4,8 +4,11 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.egg-info/
+
+# PyInstaller build artifacts
 dist/
 build/
+*.spec
 
 # Editor
 .vscode/
