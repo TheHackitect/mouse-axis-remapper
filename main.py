@@ -24,7 +24,15 @@ if PLATFORM == "linux":
             gid = grp.getgrnam("input").gr_gid
         except KeyError:
             return
-        if gid not in os.getgroups():
+        # On modern Linux (Ubuntu 26+), sg sets egid/gid but does NOT add the
+        # group to the supplemental list returned by os.getgroups(), so we must
+        # also check the effective/primary GID to avoid an infinite re-exec loop.
+        already_active = (
+            gid in os.getgroups()
+            or os.getegid() == gid
+            or os.getgid() == gid
+        )
+        if not already_active:
             cmd = " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
             os.execvp("sg", ["sg", "input", "-c", cmd])
     _ensure_input_group()
