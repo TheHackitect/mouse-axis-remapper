@@ -71,13 +71,41 @@ if PLATFORM == "win32":
     _user32   = ctypes.WinDLL("user32",   use_last_error=True)
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-    WH_MOUSE_LL      = 14
-    WM_MOUSEMOVE     = 0x0200
-    WM_QUIT          = 0x0012
-    LLMHF_INJECTED   = 0x00000001
-    MOUSEEVENTF_MOVE = 0x0001
-    INPUT_MOUSE      = 0
-    PM_REMOVE        = 0x0001
+    # Enable per-monitor DPI awareness so GetCursorPos, SetCursorPos, and hook coordinates align
+    try:
+        _user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # Per-Monitor V2
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor Aware
+        except Exception:
+            try:
+                _user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+    # Attach current thread to interactive input desktop so cursor APIs succeed
+    try:
+        _hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+        if _hdesk:
+            _user32.SetThreadDesktop(_hdesk)
+    except Exception:
+        pass
+
+    WH_MOUSE_LL               = 14
+    WM_MOUSEMOVE              = 0x0200
+    WM_QUIT                   = 0x0012
+    LLMHF_INJECTED            = 0x00000001
+    MOUSEEVENTF_MOVE          = 0x0001
+    MOUSEEVENTF_ABSOLUTE      = 0x8000
+    MOUSEEVENTF_VIRTUALDESK   = 0x4000
+    INPUT_MOUSE               = 0
+    PM_REMOVE                 = 0x0001
+    CUSTOM_EXTRA_INFO         = 0x52454D50  # 'REMP' signature to recognize our own injected events
+
+    SM_XVIRTUALSCREEN         = 76
+    SM_YVIRTUALSCREEN         = 77
+    SM_CXVIRTUALSCREEN        = 78
+    SM_CYVIRTUALSCREEN        = 79
 
     class _POINT(ctypes.Structure):
         _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -88,7 +116,7 @@ if PLATFORM == "win32":
             ("mouseData",   _wt.DWORD),
             ("flags",       _wt.DWORD),
             ("time",        _wt.DWORD),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ("dwExtraInfo", ctypes.c_size_t),
         ]
 
     class _MOUSEINPUT(ctypes.Structure):
@@ -98,7 +126,7 @@ if PLATFORM == "win32":
             ("mouseData",   ctypes.c_ulong),
             ("dwFlags",     ctypes.c_ulong),
             ("time",        ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ("dwExtraInfo", ctypes.c_size_t),
         ]
 
     class _INPUT_UNION(ctypes.Union):
@@ -109,13 +137,35 @@ if PLATFORM == "win32":
         _fields_ = [("type", ctypes.c_ulong), ("_u", _INPUT_UNION)]
 
     _HOOKPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_long, ctypes.c_int, _wt.WPARAM, _wt.LPARAM
+        ctypes.c_ssize_t, ctypes.c_int, _wt.WPARAM, _wt.LPARAM
     )
 
-    _user32.SetWindowsHookExW.restype  = ctypes.c_void_p
-    _user32.CallNextHookEx.restype     = ctypes.c_long
-    _user32.GetCursorPos.argtypes      = [ctypes.POINTER(_POINT)]
-    _user32.PostThreadMessageW.argtypes = [_wt.DWORD, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
+    _user32.SetWindowsHookExW.argtypes   = [ctypes.c_int, _HOOKPROC, ctypes.c_void_p, _wt.DWORD]
+    _user32.SetWindowsHookExW.restype    = ctypes.c_void_p
+    _user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+    _user32.UnhookWindowsHookEx.restype  = _wt.BOOL
+    _user32.CallNextHookEx.argtypes      = [ctypes.c_void_p, ctypes.c_int, _wt.WPARAM, _wt.LPARAM]
+    _user32.CallNextHookEx.restype       = ctypes.c_ssize_t
+    _user32.GetCursorPos.argtypes        = [ctypes.POINTER(_POINT)]
+    _user32.GetCursorPos.restype         = _wt.BOOL
+    _user32.SetCursorPos.argtypes        = [ctypes.c_int, ctypes.c_int]
+    _user32.SetCursorPos.restype         = _wt.BOOL
+    _user32.SendInput.argtypes           = [_wt.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    _user32.SendInput.restype            = _wt.UINT
+    _user32.GetMessageW.argtypes         = [ctypes.POINTER(_wt.MSG), _wt.HWND, _wt.UINT, _wt.UINT]
+    _user32.GetMessageW.restype          = _wt.BOOL
+    _user32.PeekMessageW.argtypes        = [ctypes.POINTER(_wt.MSG), _wt.HWND, _wt.UINT, _wt.UINT, _wt.UINT]
+    _user32.PeekMessageW.restype         = _wt.BOOL
+    _user32.PostThreadMessageW.argtypes  = [_wt.DWORD, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
+    _user32.PostThreadMessageW.restype   = _wt.BOOL
+    _user32.OpenInputDesktop.argtypes    = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+    _user32.OpenInputDesktop.restype     = ctypes.c_void_p
+    _user32.SetThreadDesktop.argtypes    = [ctypes.c_void_p]
+    _user32.SetThreadDesktop.restype     = _wt.BOOL
+    _user32.CloseDesktop.argtypes        = [ctypes.c_void_p]
+    _user32.CloseDesktop.restype         = _wt.BOOL
+    _user32.GetSystemMetrics.argtypes    = [ctypes.c_int]
+    _user32.GetSystemMetrics.restype     = ctypes.c_int
     _kernel32.GetCurrentThreadId.restype = _wt.DWORD
 
 # ── Paths & constants ─────────────────────────────────────────────────────────
@@ -224,14 +274,15 @@ def find_mice() -> list[tuple[str, str]]:
     return result
 
 
-# ── Remapping worker — Windows (WH_MOUSE_LL → SendInput) ─────────────────────
+# ── Remapping worker — Windows (WH_MOUSE_LL → SendInput / SetCursorPos) ───────
 
 if PLATFORM == "win32":
     class RemapWorker(QThread):
         """
         Installs a system-wide low-level mouse hook (WH_MOUSE_LL).
-        Real WM_MOUSEMOVE events are suppressed; a transformed relative move
-        is re-injected via SendInput.  Injected events carry LLMHF_INJECTED
+        Real WM_MOUSEMOVE events are suppressed; the transformed move
+        is re-injected via SendInput (absolute coordinates) and SetCursorPos.
+        Injected events carry CUSTOM_EXTRA_INFO and LLMHF_INJECTED
         so the hook ignores them, preventing infinite loops.
         """
         status = pyqtSignal(str, bool)   # (message, is_error)
@@ -244,6 +295,7 @@ if PLATFORM == "win32":
             self.fy    = fy
             self._quit = threading.Event()
             self._tid  = 0
+            self._hook_proc = None
 
         def stop(self) -> None:
             self._quit.set()
@@ -254,38 +306,68 @@ if PLATFORM == "win32":
 
         def run(self) -> None:
             self._tid = int(_kernel32.GetCurrentThreadId())
+            if self._quit.is_set():
+                return
 
-            # Prime the message queue so PostThreadMessageW works immediately
+            # Attach thread to interactive input desktop so cursor APIs succeed
+            hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+            if hdesk:
+                _user32.SetThreadDesktop(hdesk)
+
+            # Prime message queue so PostThreadMessageW works immediately
             msg = _wt.MSG()
             _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE)
 
-            hook_ref: list = [None]   # mutable so the closure can read it
+            hook_ref: list = [None]
 
             @_HOOKPROC
             def _hook(nCode, wParam, lParam):
                 if nCode >= 0 and wParam == WM_MOUSEMOVE:
+                    # Pass through unmodified if rotation is 0 and no flips
+                    if self.rot == 0 and not self.fx and not self.fy:
+                        return _user32.CallNextHookEx(hook_ref[0], nCode, wParam, lParam)
+
                     info = ctypes.cast(
                         lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)
                     ).contents
+
                     # Skip events we injected ourselves
-                    if not (info.flags & LLMHF_INJECTED):
-                        cur = _POINT()
-                        _user32.GetCursorPos(ctypes.byref(cur))
+                    if info.dwExtraInfo == CUSTOM_EXTRA_INFO or (info.flags & LLMHF_INJECTED):
+                        return _user32.CallNextHookEx(hook_ref[0], nCode, wParam, lParam)
+
+                    cur = _POINT()
+                    if _user32.GetCursorPos(ctypes.byref(cur)):
                         dx = info.pt.x - cur.x
                         dy = info.pt.y - cur.y
                         if dx or dy:
                             nx, ny = transform(dx, dy, self.rot, self.fx, self.fy)
-                            mi = _MOUSEINPUT()
-                            mi.dx     = nx
-                            mi.dy     = ny
-                            mi.dwFlags = MOUSEEVENTF_MOVE
+
+                            vx = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+                            vy = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+                            vw = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+                            vh = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+                            if vw <= 1 or vh <= 1:
+                                vx, vy = 0, 0
+                                vw = _user32.GetSystemMetrics(0)
+                                vh = _user32.GetSystemMetrics(1)
+
+                            target_x = max(vx, min(vx + vw - 1, cur.x + nx))
+                            target_y = max(vy, min(vy + vh - 1, cur.y + ny))
+
+                            norm_x = int((target_x - vx) * 65535 / (vw - 1)) if vw > 1 else 0
+                            norm_y = int((target_y - vy) * 65535 / (vh - 1)) if vh > 1 else 0
+
                             inp = _INPUT()
                             inp.type = INPUT_MOUSE
-                            inp.mi   = mi
-                            _user32.SendInput(
-                                1, ctypes.byref(inp), ctypes.sizeof(_INPUT)
-                            )
-                        return 1  # suppress original event
+                            inp.mi.dx = norm_x
+                            inp.mi.dy = norm_y
+                            inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+                            inp.mi.dwExtraInfo = CUSTOM_EXTRA_INFO
+                            _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+                            _user32.SetCursorPos(target_x, target_y)
+
+                            return 1  # suppress original hardware event
+
                 return _user32.CallNextHookEx(hook_ref[0], nCode, wParam, lParam)
 
             self._hook_proc = _hook   # prevent GC while hook is active
@@ -297,21 +379,27 @@ if PLATFORM == "win32":
                     f"Failed to install mouse hook (error {err}).\n\n"
                     "Try running the app as Administrator.", True
                 )
+                if hdesk:
+                    _user32.CloseDesktop(hdesk)
                 return
 
             self.status.emit("Active — remapping all mice (Windows hook)", False)
 
-            # Message loop — required for WH_MOUSE_LL to fire
-            while not self._quit.is_set():
-                if _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-                    if msg.message == WM_QUIT:
+            try:
+                # Message loop — GetMessageW waits efficiently until WM_QUIT
+                while not self._quit.is_set():
+                    res = _user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                    if res <= 0:
                         break
                     _user32.TranslateMessage(ctypes.byref(msg))
                     _user32.DispatchMessageW(ctypes.byref(msg))
-                else:
-                    time.sleep(0.001)   # 1 ms idle — minimal CPU use
+            finally:
+                if hook_ref[0]:
+                    _user32.UnhookWindowsHookEx(hook_ref[0])
+                    hook_ref[0] = None
+                if hdesk:
+                    _user32.CloseDesktop(hdesk)
 
-            _user32.UnhookWindowsHookEx(hook_ref[0])
             self.status.emit("Stopped", False)
 
 # ── Remapping worker — Linux (evdev → uinput) ─────────────────────────────────
@@ -461,12 +549,21 @@ if PLATFORM != "win32":
 def set_autostart(enabled: bool) -> None:
     if PLATFORM == "win32":
         if enabled:
-            # .bat in Windows Startup folder
-            exe = str(Path(sys.executable).parent / "mouse-axis-remapper.exe")
-            if not Path(exe).exists():
-                exe = sys.executable
+            exe = Path(sys.executable).parent / "mouse-axis-remapper.exe"
+            dist_exe = SCRIPT_PATH.parent / "dist" / "mouse-axis-remapper.exe"
+            desktop_exe = Path.home() / "Desktop" / "mouse-axis-remapper.exe"
+            if exe.exists():
+                cmd = f'start "" "{exe}"'
+            elif dist_exe.exists():
+                cmd = f'start "" "{dist_exe}"'
+            elif desktop_exe.exists():
+                cmd = f'start "" "{desktop_exe}"'
+            else:
+                pyw = Path(sys.executable).parent / "pythonw.exe"
+                py = pyw if pyw.exists() else sys.executable
+                cmd = f'start "" "{py}" "{SCRIPT_PATH}"'
             AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
-            AUTOSTART.write_text(f'@echo off\nstart "" "{exe}"\n', encoding="utf-8")
+            AUTOSTART.write_text(f'@echo off\n{cmd}\n', encoding="utf-8")
         else:
             AUTOSTART.unlink(missing_ok=True)
     else:
@@ -525,6 +622,13 @@ QPushButton:disabled { background: #45475a !important; color: #6c7086 !important
 class App(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        if PLATFORM == "win32":
+            try:
+                hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+                if hdesk:
+                    _user32.SetThreadDesktop(hdesk)
+            except Exception:
+                pass
         self._cfg = load_cfg()
         self._worker: "RemapWorker | None" = None
         self._build()
@@ -780,6 +884,14 @@ class App(QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if PLATFORM == "win32":
+        try:
+            hdesk = _user32.OpenInputDesktop(0, False, 0x01FF)
+            if hdesk:
+                _user32.SetThreadDesktop(hdesk)
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("MouseAxisRemapper")
     app.setQuitOnLastWindowClosed(True)
